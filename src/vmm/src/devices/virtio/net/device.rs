@@ -334,11 +334,15 @@ impl Net {
         rx_rate_limiter: RateLimiter,
         tx_rate_limiter: RateLimiter,
     ) -> Result<Self, NetError> {
-        let tap = Tap::open_named(tap_if_name).map_err(NetError::TapOpen)?;
+        let tap = Tap::open_named_or_fd(tap_if_name).map_err(NetError::TapOpen)?;
 
-        let vnet_hdr_size = i32::try_from(vnet_hdr_len()).unwrap();
-        tap.set_vnet_hdr_size(vnet_hdr_size)
-            .map_err(NetError::TapSetVnetHdrSize)?;
+        // An `fdp:`-spec queue arrives with the vnet header size already set
+        // by the launcher; re-setting it would only burn a rtnl round trip.
+        if !tap.vnet_hdr_size_preset {
+            let vnet_hdr_size = i32::try_from(vnet_hdr_len()).unwrap();
+            tap.set_vnet_hdr_size(vnet_hdr_size)
+                .map_err(NetError::TapSetVnetHdrSize)?;
+        }
 
         Self::new_with_tap(id, tap, guest_mac, rx_rate_limiter, tx_rate_limiter)
     }
@@ -758,6 +762,19 @@ impl Net {
         }
     }
 
+    /// Offload flags the launcher (AgentENV) presets on every
+    /// pre-configured queue (`fdp:` spec) when attaching it: the set a
+    /// standard Linux guest negotiates. [`Net::activate`] skips its
+    /// TUNSETOFFLOAD ioctl — an rtnl round trip paid on every snapshot
+    /// resume — when the guest acked exactly this set on a pre-configured
+    /// queue; any other negotiation still programs the negotiated flags,
+    /// correcting the preset in both directions. Must stay in sync with
+    /// AgentENV's `FC_TAP_OFFLOAD_PRESET`.
+    pub(crate) const LAUNCHER_PRESET_OFFLOAD: u32 = generated::TUN_F_CSUM
+        | generated::TUN_F_TSO4
+        | generated::TUN_F_TSO6
+        | generated::TUN_F_UFO;
+
     /// Builds the offload features we will setup on the TAP device based on the features that the
     /// guest supports.
     pub fn build_tap_offload_features(guest_supported_features: u64) -> u32 {
@@ -934,6 +951,14 @@ impl Net {
     }
 }
 
+/// Whether `activate()` can trust the launcher's offload preset instead of
+/// issuing TUNSETOFFLOAD: only queues handed over pre-configured (`fdp:`,
+/// [`Tap::vnet_hdr_size_preset`]) carry the preset, and only when the guest
+/// negotiated exactly the preset set.
+fn skips_tap_offload_ioctl(vnet_hdr_size_preset: bool, supported_flags: u32) -> bool {
+    vnet_hdr_size_preset && supported_flags == Net::LAUNCHER_PRESET_OFFLOAD
+}
+
 impl VirtioDevice for Net {
     impl_device_type!(VirtioDeviceType::Net);
 
@@ -1019,9 +1044,11 @@ impl VirtioDevice for Net {
         }
 
         let supported_flags: u32 = Net::build_tap_offload_features(self.acked_features);
-        self.tap
-            .set_offload(supported_flags)
-            .map_err(super::super::ActivateError::TapSetOffload)?;
+        if !skips_tap_offload_ioctl(self.tap.vnet_hdr_size_preset, supported_flags) {
+            self.tap
+                .set_offload(supported_flags)
+                .map_err(super::super::ActivateError::TapSetOffload)?;
+        }
 
         self.rx_buffer.min_buffer_size = self.minimum_rx_buffer_size();
 
@@ -1141,6 +1168,36 @@ pub mod tests {
         let mut net = default_net();
         set_mac(&mut net, MacAddr::from_str("11:22:33:44:55:66").unwrap());
         assert_eq!(net.device_type(), VirtioDeviceType::Net);
+    }
+
+    #[test]
+    // The launcher preset must mirror what a standard Linux guest acks, and
+    // `skips_tap_offload_ioctl` must only skip for a pre-configured queue
+    // (`fdp:`) whose negotiated set matches the preset exactly; any other
+    // negotiation still programs the negotiated flags at activate.
+    fn test_tap_offload_preset_skip() {
+        let standard_guest = (1 << VIRTIO_NET_F_GUEST_CSUM)
+            | (1 << VIRTIO_NET_F_GUEST_TSO4)
+            | (1 << VIRTIO_NET_F_GUEST_TSO6)
+            | (1 << VIRTIO_NET_F_GUEST_UFO);
+        assert_eq!(
+            Net::build_tap_offload_features(standard_guest),
+            Net::LAUNCHER_PRESET_OFFLOAD
+        );
+
+        assert!(skips_tap_offload_ioctl(true, Net::LAUNCHER_PRESET_OFFLOAD));
+        assert!(!skips_tap_offload_ioctl(
+            false,
+            Net::LAUNCHER_PRESET_OFFLOAD
+        ));
+        assert!(!skips_tap_offload_ioctl(
+            true,
+            Net::LAUNCHER_PRESET_OFFLOAD & !generated::TUN_F_UFO
+        ));
+        assert!(!skips_tap_offload_ioctl(
+            true,
+            Net::LAUNCHER_PRESET_OFFLOAD & !generated::TUN_F_TSO6
+        ));
     }
 
     #[test]

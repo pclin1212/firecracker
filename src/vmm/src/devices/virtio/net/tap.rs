@@ -35,6 +35,10 @@ pub enum TapError {
     SetOffloadFlags(IoError),
     /// Error while setting size of the vnet header: {0}
     SetSizeOfVnetHdr(IoError),
+    /// Invalid `fdp:` tap open spec: {0}
+    InvalidFdSpec(String),
+    /// Failed to dup the inherited tap descriptor: {0}
+    DupInheritedTap(IoError),
 }
 
 const TUNTAP: ::std::os::raw::c_uint = 84;
@@ -51,6 +55,13 @@ ioctl_iow_nr!(TUNSETVNETHDRSZ, TUNTAP, 216, ::std::os::raw::c_int);
 pub struct Tap {
     tap_file: File,
     pub(crate) if_name: [u8; IFACE_NAME_MAX_LEN],
+    /// Whether the queue arrived via an `fdp:` spec with its vnet header
+    /// size already set to the value Firecracker would pick, so the
+    /// [`Net::new`](crate::devices::virtio::net::Net::new) configuration
+    /// step can be skipped. It also marks the queue as carrying the
+    /// launcher's offload preset, gating the TUNSETOFFLOAD skip in
+    /// `Net::activate`.
+    pub(crate) vnet_hdr_size_preset: bool,
 }
 
 // Returns a byte vector representing the contents of a null terminated C string which
@@ -68,6 +79,49 @@ fn build_terminated_if_name(if_name: &str) -> Result<[u8; IFACE_NAME_MAX_LEN], T
     terminated_if_name[..if_name.len()].copy_from_slice(if_name);
 
     Ok(terminated_if_name)
+}
+
+/// The shapes a tap open spec (`host_dev_name`) can take: a plain interface
+/// name, or an `fdp:<fd>:<if_name>` spec naming a pre-opened, pre-configured
+/// queue descriptor inherited from the launcher process.
+enum TapOpenSpec<'a> {
+    Name(&'a str),
+    Fdp { fd: RawFd, if_name: &'a str },
+}
+
+const FDP_SPEC_PREFIX: &str = "fdp:";
+
+fn parse_tap_open_spec(spec: &str) -> Result<TapOpenSpec<'_>, TapError> {
+    match spec.strip_prefix(FDP_SPEC_PREFIX) {
+        None => Ok(TapOpenSpec::Name(spec)),
+        Some(rest) => {
+            parse_fd_spec_body(spec, rest).map(|(fd, if_name)| TapOpenSpec::Fdp { fd, if_name })
+        }
+    }
+}
+
+fn parse_fd_spec_body<'a>(spec: &'a str, rest: &'a str) -> Result<(RawFd, &'a str), TapError> {
+    let invalid = || TapError::InvalidFdSpec(spec.to_owned());
+    let (fd, if_name) = rest.split_once(':').ok_or_else(invalid)?;
+    let fd = fd.parse::<RawFd>().map_err(|_| invalid())?;
+    // Stdio descriptors are never valid, and an empty name always
+    // fails the later checks; reject both up front.
+    if fd <= 2 || if_name.is_empty() {
+        return Err(invalid());
+    }
+    Ok((fd, if_name))
+}
+
+/// Dups a descriptor inherited from the launcher process instead of taking it
+/// over, so consumption is idempotent and the parked descriptor stays valid
+/// for the process lifetime.
+fn dup_inherited_fd(fd: RawFd) -> Result<RawFd, TapError> {
+    // SAFETY: fcntl with any fd number is safe; fails with EBADF when invalid.
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if dup < 0 {
+        return Err(TapError::DupInheritedTap(IoError::last_os_error()));
+    }
+    Ok(dup)
 }
 
 #[derive(Copy, Clone)]
@@ -147,6 +201,36 @@ impl Tap {
             tap_file: tuntap,
             // SAFETY: Safe since only the name is accessed, and it's cloned out.
             if_name: unsafe { ifreq.ifr_ifrn.ifrn_name },
+            vnet_hdr_size_preset: false,
+        })
+    }
+
+    /// Opens the tap described by `host_dev_name`: a plain interface name, or
+    /// an `fdp:<fd>:<if_name>` spec naming a pre-opened, pre-configured queue
+    /// descriptor inherited from the launcher process.
+    pub fn open_named_or_fd(spec: &str) -> Result<Tap, TapError> {
+        match parse_tap_open_spec(spec)? {
+            TapOpenSpec::Name(name) => Tap::open_named(name),
+            TapOpenSpec::Fdp { fd, if_name } => Tap::from_preconfigured_fd(fd, if_name),
+        }
+    }
+
+    /// Wraps a pre-opened, pre-configured queue descriptor inherited from the
+    /// launcher process. The launcher contract for the `fdp:` spec is that the
+    /// queue was attached with the flags [`Tap::open_named`] uses
+    /// (`IFF_TAP | IFF_NO_PI | IFF_VNET_HDR`) and its vnet header size already
+    /// set to the value Firecracker would pick; neither a TUNGETIFF validation
+    /// nor a TUNSETVNETHDRSZ configuration runs on this path, which is what
+    /// saves those rtnl round trips. A launcher violating it fails loudly on
+    /// the first read/write rather than misbehaving silently.
+    fn from_preconfigured_fd(fd: RawFd, if_name: &str) -> Result<Tap, TapError> {
+        // SAFETY: `dup_inherited_fd` just handed us ownership of a valid dup.
+        let tap_file = unsafe { File::from_raw_fd(dup_inherited_fd(fd)?) };
+        let if_name = build_terminated_if_name(if_name)?;
+        Ok(Tap {
+            tap_file,
+            if_name,
+            vnet_hdr_size_preset: true,
         })
     }
 
@@ -286,6 +370,71 @@ pub mod tests {
     fn test_raw_fd() {
         let tap = Tap::open_named("").unwrap();
         assert_eq!(tap.as_raw_fd(), tap.tap_file.as_raw_fd());
+    }
+
+    #[test]
+    fn test_parse_tap_open_spec() {
+        assert!(matches!(
+            parse_tap_open_spec("tap0").unwrap(),
+            TapOpenSpec::Name("tap0")
+        ));
+        assert!(matches!(
+            parse_tap_open_spec("fdp:3:tap0").unwrap(),
+            TapOpenSpec::Fdp {
+                fd: 3,
+                if_name: "tap0"
+            }
+        ));
+
+        // An `fd:`-prefixed spec from a launcher of the removed plain fd:
+        // era parses as a plain name and fails interface creation loudly
+        // instead of being silently accepted as a queue handoff.
+        assert!(matches!(
+            parse_tap_open_spec("fd:3:tap0").unwrap(),
+            TapOpenSpec::Name("fd:3:tap0")
+        ));
+
+        for spec in ["fdp:abc:tap0", "fdp:3:", "fdp:1:tap0", "fdp:3tap0"] {
+            assert!(
+                matches!(parse_tap_open_spec(spec), Err(TapError::InvalidFdSpec(_))),
+                "expected InvalidFdSpec for {spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_preconfigured_fd_trusts_spec() {
+        let tap = Tap::open_named("preconftap").unwrap();
+        // The preconfigured path runs no validation ioctls at all; the wrapped
+        // queue carries the spec name and is marked as having its vnet header
+        // size preset.
+        let preconf = Tap::from_preconfigured_fd(tap.as_raw_fd(), "preconftap").unwrap();
+        assert_eq!(preconf.if_name_as_str(), "preconftap");
+        assert!(preconf.vnet_hdr_size_preset);
+        assert_ne!(preconf.as_raw_fd(), tap.as_raw_fd());
+        // SAFETY: fcntl with a valid fd is safe.
+        assert!(unsafe { libc::fcntl(tap.as_raw_fd(), libc::F_GETFD) } >= 0);
+
+        // A closed descriptor cannot be dup'd.
+        assert!(matches!(
+            Tap::from_preconfigured_fd(-1, "preconftap"),
+            Err(TapError::DupInheritedTap(_))
+        ));
+
+        // An invalid name is still rejected.
+        assert!(matches!(
+            Tap::from_preconfigured_fd(tap.as_raw_fd(), "a123456789abcdef"),
+            Err(TapError::InvalidIfname)
+        ));
+    }
+
+    #[test]
+    fn test_open_named_or_fd_marks_fdp_as_preset() {
+        let tap = Tap::open_named("fdpspectap").unwrap();
+        let fdp_spec = format!("fdp:{}:fdpspectap", tap.as_raw_fd());
+        let opened = Tap::open_named_or_fd(&fdp_spec).unwrap();
+        assert!(opened.vnet_hdr_size_preset);
+        assert_eq!(opened.if_name_as_str(), "fdpspectap");
     }
 
     #[test]
